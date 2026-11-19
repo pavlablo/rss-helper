@@ -1,0 +1,51 @@
+name: Flat watcher
+
+on:
+  schedule:
+    # Каждые 10 минут, со сдвигом на 3-ю минуту: в :00 у GitHub очередь и запуски опаздывают сильнее.
+    # Время в cron — UTC, но для "каждые 10 минут" это неважно.
+    - cron: "3-59/10 * * * *"
+  workflow_dispatch: {}   # кнопка "Run workflow" для ручного запуска
+
+permissions:
+  contents: write         # чтобы закоммитить seen.json
+
+concurrency:
+  group: flat-watcher     # два прогона одновременно не идут
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Check listings
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # MAX_PRICE: "901"   # необязательный доп. фильтр по цене, € в месяц
+        run: python watcher.py
+
+      - name: Save seen.json
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add seen.json
+          if git diff --cached --quiet; then
+            echo "Ничего нового"
+          else
+            git commit -m "Update seen listings"
+            git pull --rebase --autostash
+            git push
+          fi
