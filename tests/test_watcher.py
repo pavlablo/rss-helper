@@ -316,22 +316,28 @@ class RunTests(unittest.TestCase):
         self.assertIn("199999999", self.sent[0])
         self.assertNotIn("Первый платёж", self.sent[0])
 
-    def test_photos_go_first_and_never_block_text(self):
+    def test_photos_with_caption_and_never_block_text(self):
         calls = []
         info = watcher.Info(photos=["https://x/1.jpg", "https://x/2.jpg"])
         item = watcher.Listing("bazos", "1", "Byt", "500 €", "", "https://x.sk/")
-        with mock.patch.object(watcher, "load_info", return_value=info), \
-                mock.patch.object(watcher, "tg_send_photos", side_effect=lambda u: calls.append(("photos", len(u))) or 2), \
-                mock.patch.object(watcher, "tg_send", side_effect=lambda t, preview=True: calls.append(("text", preview))):
-            watcher.send_listing(item)
-        self.assertEqual(calls, [("photos", 2), ("text", False)])  # альбом, потом текст без превью ссылки
 
-        calls.clear()
-        with mock.patch.object(watcher, "load_info", return_value=info), \
-                mock.patch.object(watcher, "tg_send_photos", side_effect=RuntimeError("Telegram: bad photo")), \
-                mock.patch.object(watcher, "tg_send", side_effect=lambda t, preview=True: calls.append(("text", preview))):
-            watcher.send_listing(item)
+        def send(photos_effect, title="Byt"):
+            calls.clear()
+            item.title = title
+            with mock.patch.object(watcher, "load_info", return_value=info), \
+                    mock.patch.object(watcher, "tg_send_photos", side_effect=photos_effect), \
+                    mock.patch.object(watcher, "tg_send", side_effect=lambda t, preview=True: calls.append(("text", preview))), \
+                    mock.patch.object(watcher.time, "sleep"):
+                watcher.send_listing(item)
+
+        send(lambda u, caption="": calls.append(("album", len(u), "Byt" in caption)) or 2)
+        self.assertEqual(calls, [("album", 2, True)])  # одно сообщение: альбом с текстом в подписи
+        send(lambda u, caption="": calls.append(("album", len(u), bool(caption))) or 2, title="Byt " * 400)
+        self.assertEqual(calls, [("album", 2, False), ("text", False)])  # длиннее 1024 — текст отдельно под альбомом
+        send(RuntimeError("Telegram: bad photo"))
         self.assertEqual(calls, [("text", True)])  # фото сломались — текст всё равно ушёл, с превью
+        send(lambda u, caption="": 0)
+        self.assertEqual(calls, [("text", True)])  # ни одно фото не скачалось — обычное сообщение
 
     def test_max_price_filter(self):
         with mock.patch.object(watcher, "MAX_PRICE", 901.0):

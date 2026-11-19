@@ -63,7 +63,8 @@ SOURCE_LABELS = {
 
 STATE_FILE = Path(os.environ.get("STATE_FILE", Path(__file__).with_name("seen.json")))
 MAX_PRICE = float(os.environ["MAX_PRICE"]) if os.environ.get("MAX_PRICE") else None  # доп. фильтр, € в месяц
-MAX_MESSAGES_PER_RUN = int(os.environ.get("MAX_MESSAGES_PER_RUN", "10"))  # объявлений за прогон, остальные — в следующий
+MAX_MESSAGES_PER_RUN = int(os.environ.get("MAX_MESSAGES_PER_RUN", "25"))  # объявлений за прогон, остальные — в следующий
+PAUSE_BETWEEN_LISTINGS = 3  # секунд между объявлениями: приходят по очереди, а не пачкой
 MAX_PHOTOS = int(os.environ.get("MAX_PHOTOS", "5"))  # фото на объявление (альбом в Telegram — до 10)
 FORGET_AFTER_DAYS = 90       # ID старше этого удаляются из seen.json
 ALERT_AFTER_FAILURES = 6     # столько неудачных прогонов подряд -> сообщение "источник сломался"
@@ -839,8 +840,16 @@ def download_photo(url: str) -> bytes | None:
     return data
 
 
-def tg_send_photos(urls: list[str]) -> int:
-    """Альбом из первых MAX_PHOTOS фото. Возвращает, сколько фото ушло (0 — ни одно не скачалось)."""
+CAPTION_LIMIT = 1024  # видимых символов в подписи к фото (теги и адреса ссылок не считаются)
+
+
+def visible_len(text_html: str) -> int:
+    return len(html.unescape(re.sub(r"<[^>]+>", "", text_html)).encode("utf-16-le")) // 2  # Telegram считает в UTF-16
+
+
+def tg_send_photos(urls: list[str], caption: str = "") -> int:
+    """Альбом из первых MAX_PHOTOS фото, caption — подпись под ним. Возвращает, сколько фото ушло
+    (0 — ни одно не скачалось, тогда ничего не отправлено)."""
     photos = [p for p in (download_photo(u) for u in urls[:MAX_PHOTOS]) if p]
     if not photos:
         return 0
@@ -849,25 +858,30 @@ def tg_send_photos(urls: list[str]) -> int:
         raise SystemExit("Нет переменной окружения TELEGRAM_CHAT_ID")
     files = {f"p{i}": (f"p{i}.jpg", data, "image/jpeg") for i, data in enumerate(photos)}
     if len(photos) == 1:
-        tg_api("sendPhoto", files={"photo": files["p0"]}, chat_id=chat_id)
+        tg_api("sendPhoto", files={"photo": files["p0"]}, chat_id=chat_id, caption=caption, parse_mode="HTML")
     else:
         media = [{"type": "photo", "media": f"attach://p{i}"} for i in range(len(photos))]
+        if caption:  # подпись у первого фото Telegram показывает под всем альбомом
+            media[0].update(caption=caption, parse_mode="HTML")
         tg_api("sendMediaGroup", files=files, chat_id=chat_id, media=json.dumps(media))
     return len(photos)
 
 
 def send_listing(item: Listing) -> None:
-    """Сначала альбом с фото, под ним текст: в уведомлении видно текст с ценой, а не "Альбом"."""
+    """Альбом с текстом объявления в подписи — одно сообщение. Текст длиннее лимита подписи
+    уходит отдельным сообщением под альбомом; без фото — обычное сообщение с превью ссылки."""
     info = load_info(item)  # None, если страница объявления не открылась — тогда без фото и деталей
+    text = format_listing(item, info)
+    fits = visible_len(text) <= CAPTION_LIMIT
     sent = 0
     if info and info.photos:
         try:
-            sent = tg_send_photos(info.photos)
+            sent = tg_send_photos(info.photos, caption=text if fits else "")
         except Exception as e:  # noqa: BLE001 — без фото объявление всё равно нужно прислать
             print(f"⚠️ фото не отправились: {e}", file=sys.stderr)
-    tg_send(format_listing(item, info), preview=not sent)  # фото уже есть — превью ссылки не нужно
-    if sent:
-        time.sleep(sent)  # альбом для лимитов Telegram — почти как столько же сообщений
+    if not sent or not fits:
+        tg_send(text, preview=not sent)
+    time.sleep(PAUSE_BETWEEN_LISTINGS + sent)  # альбом для лимитов Telegram — почти как столько же сообщений
 
 
 def notify(text: str) -> None:
@@ -1051,7 +1065,6 @@ def run(dry_run: bool = False) -> int:
                 break
             known[item.id] = now
             budget -= 1
-            time.sleep(1.1)
 
     if not dry_run:
         save_state(state)
@@ -1080,7 +1093,6 @@ def send_samples() -> None:
             continue
         send_listing(items[0])
         print(f"✔ {SOURCE_LABELS[source]}: отправил {items[0].id}")
-        time.sleep(1.1)
 
 
 def show_chat_ids() -> None:

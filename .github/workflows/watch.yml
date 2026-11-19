@@ -19,7 +19,7 @@ concurrency:
 jobs:
   watch:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 15   # до 25 объявлений с фото и паузами между ними — около 5 минут
     steps:
       - uses: actions/checkout@v5
 
