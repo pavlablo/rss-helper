@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import html
+import io
 import itertools
 import json
 import os
@@ -62,7 +63,8 @@ SOURCE_LABELS = {
 
 STATE_FILE = Path(os.environ.get("STATE_FILE", Path(__file__).with_name("seen.json")))
 MAX_PRICE = float(os.environ["MAX_PRICE"]) if os.environ.get("MAX_PRICE") else None  # доп. фильтр, € в месяц
-MAX_MESSAGES_PER_RUN = int(os.environ.get("MAX_MESSAGES_PER_RUN", "25"))
+MAX_MESSAGES_PER_RUN = int(os.environ.get("MAX_MESSAGES_PER_RUN", "10"))  # объявлений за прогон, остальные — в следующий
+MAX_PHOTOS = int(os.environ.get("MAX_PHOTOS", "5"))  # фото на объявление (альбом в Telegram — до 10)
 FORGET_AFTER_DAYS = 90       # ID старше этого удаляются из seen.json
 ALERT_AFTER_FAILURES = 6     # столько неудачных прогонов подряд -> сообщение "источник сломался"
 
@@ -264,6 +266,7 @@ class Detail:
     energies: int | None = None             # из отдельного поля сайта, если есть
     energies_included: bool | None = None
     deposit: int | None = None
+    photos: list[str] = field(default_factory=list)  # полноразмерные фото по порядку галереи
 
 
 def page_text(el) -> str:
@@ -286,6 +289,12 @@ def parse_topreality_detail(page_html: str) -> Detail:
     agency = soup.select_one(".a-agency")
     if agency:
         d.agency, d.agency_name = True, clean(agency.get_text())
+    # Большое фото только первое: "/topfoto/<slug>-d1-947-9471042_1.jpg". Остальные есть превью
+    # "/topfoto/t/947/9471042-5-7.jpg", а большие лежат по тому же шаблону с "_5.jpg".
+    m = re.search(r'/topfoto/([^"\'\s]+?-d1-\d+-(\d+))_1\.jpe?g', page_html)
+    if m:
+        nums = sorted({int(n) for n in re.findall(rf"/topfoto/t/\d+/{m.group(2)}-(\d+)-\d+\.jpe?g", page_html)} | {1})
+        d.photos = [f"https://www.topreality.sk/topfoto/{m.group(1)}_{n}.jpg" for n in nums]
     return d
 
 
@@ -296,6 +305,13 @@ def parse_bazos_detail(page_html: str) -> Detail:
         cells = [clean(c.get_text(" ")) for c in row.select("td")]
         if len(cells) >= 2 and cells[0].startswith("Meno") and AGENCY_NAME_RE.search(cells[1]):
             d.agency, d.agency_name = True, cells[1].replace(" ,", ",")
+    # "https://www.bazos.sk/img/2/263/197669263.jpg" — N-е фото объявления 197669263 (превью — "/img/2t/")
+    by_id: dict[str, set[int]] = {}
+    for n, lid in re.findall(r"https://www\.bazos\.sk/img/(\d+)/\d+/(\d+)\.jpe?g", page_html):
+        by_id.setdefault(lid, set()).add(int(n))
+    if by_id:  # на странице бывают и чужие объявления — берём то, у которого больше всего фото
+        lid, nums = max(by_id.items(), key=lambda kv: len(kv[1]))
+        d.photos = [f"https://www.bazos.sk/img/{n}/{lid[-3:]}/{lid}.jpg" for n in sorted(nums)]
     return d
 
 
@@ -323,6 +339,10 @@ def parse_nehnutelnosti_detail(page_html: str) -> Detail:
     m = re.search(r'"label":"Depozit[^"]*","value":"([\d  .]+)', raw)
     if m:
         d.deposit = money(m.group(1).strip())
+    # Первый блок "media" — фото самого объявления. Ссылки подписаны (st=...), "&" надо вернуть в "&"
+    m = re.search(r'"media":\{"photos":\[(.*?)\]', raw)
+    if m:
+        d.photos = [u.replace("\\u0026", "&") for u in re.findall(r'"largeUrl":"([^"]+)"', m.group(1))]
     return d
 
 
@@ -529,6 +549,7 @@ class Info:
     rooms: str = ""
     street: str = ""
     street_alt: str = ""            # в тексте другая улица, чем в поле сайта — покажем обе с "?"
+    photos: list[str] = field(default_factory=list)
     persons_note: str = ""          # "вдвоём 800 €", если цена зависит от числа жильцов
     warning: str = ""
     aircon: bool | None = None
@@ -684,7 +705,7 @@ def analyze(item: Listing, d: Detail) -> Info:
         if not rooms_from(item.title) and ("," in in_text and rooms[:1] == in_text[:1] or "gars" in in_text.lower()):
             rooms = in_text  # "Kategória: 2 izbový", а в тексте "2,5 izbový byt" или "2-garsónku"
     city = OTHER_CITY_RE.search(head)
-    info = Info(rooms=rooms,
+    info = Info(rooms=rooms, photos=d.photos,
                 street=(canonical_street(d.street) or d.street if d.street else "")
                 or street_from(item.title) or street_from(d.text),
                 warning=f"похоже, это не Братислава ({city.group(0)})" if city else "",
@@ -775,12 +796,12 @@ def collect(source: str) -> list[Listing]:
 # Telegram
 # ---------------------------------------------------------------------------
 
-def tg_api(method: str, **params) -> dict:
+def tg_api(method: str, files: dict | None = None, **params) -> dict:
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not token:
         raise SystemExit("Нет переменной окружения TELEGRAM_BOT_TOKEN")
     for _ in range(5):
-        r = requests.post(f"https://api.telegram.org/bot{token}/{method}", data=params, timeout=30)
+        r = requests.post(f"https://api.telegram.org/bot{token}/{method}", data=params, files=files, timeout=60)
         data = r.json()
         if r.status_code == 429:  # слишком часто — ждём, сколько просит Telegram
             time.sleep(int(data.get("parameters", {}).get("retry_after", 5)) + 1)
@@ -797,6 +818,56 @@ def tg_send(text: str, preview: bool = True) -> None:
         raise SystemExit("Нет переменной окружения TELEGRAM_CHAT_ID")
     tg_api("sendMessage", chat_id=chat_id, text=text, parse_mode="HTML",
            disable_web_page_preview="false" if preview else "true")
+
+
+def download_photo(url: str) -> bytes | None:
+    """Фото в JPEG. Nehnuteľnosti отдаёт WebP — переводим, чтобы Telegram точно показал как обычное фото."""
+    try:
+        r = session.get(url, timeout=30, headers={"Accept": "image/avif,image/webp,image/*,*/*;q=0.8"})
+        r.raise_for_status()
+    except requests.RequestException as e:
+        print(f"⚠️ фото не скачалось {url[:80]}: {e}", file=sys.stderr)
+        return None
+    if not r.headers.get("content-type", "").startswith("image/"):
+        return None
+    data = r.content
+    if data[8:12] == b"WEBP" or "webp" in r.headers.get("content-type", ""):
+        from PIL import Image  # импорт здесь: без фото Pillow не нужен
+        buf = io.BytesIO()
+        Image.open(io.BytesIO(data)).convert("RGB").save(buf, "JPEG", quality=88)
+        data = buf.getvalue()
+    return data
+
+
+def tg_send_photos(urls: list[str]) -> int:
+    """Альбом из первых MAX_PHOTOS фото. Возвращает, сколько фото ушло (0 — ни одно не скачалось)."""
+    photos = [p for p in (download_photo(u) for u in urls[:MAX_PHOTOS]) if p]
+    if not photos:
+        return 0
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+    if not chat_id:
+        raise SystemExit("Нет переменной окружения TELEGRAM_CHAT_ID")
+    files = {f"p{i}": (f"p{i}.jpg", data, "image/jpeg") for i, data in enumerate(photos)}
+    if len(photos) == 1:
+        tg_api("sendPhoto", files={"photo": files["p0"]}, chat_id=chat_id)
+    else:
+        media = [{"type": "photo", "media": f"attach://p{i}"} for i in range(len(photos))]
+        tg_api("sendMediaGroup", files=files, chat_id=chat_id, media=json.dumps(media))
+    return len(photos)
+
+
+def send_listing(item: Listing) -> None:
+    """Сначала альбом с фото, под ним текст: в уведомлении видно текст с ценой, а не "Альбом"."""
+    info = load_info(item)  # None, если страница объявления не открылась — тогда без фото и деталей
+    sent = 0
+    if info and info.photos:
+        try:
+            sent = tg_send_photos(info.photos)
+        except Exception as e:  # noqa: BLE001 — без фото объявление всё равно нужно прислать
+            print(f"⚠️ фото не отправились: {e}", file=sys.stderr)
+    tg_send(format_listing(item, info), preview=not sent)  # фото уже есть — превью ссылки не нужно
+    if sent:
+        time.sleep(sent)  # альбом для лимитов Telegram — почти как столько же сообщений
 
 
 def notify(text: str) -> None:
@@ -966,14 +1037,15 @@ def run(dry_run: bool = False) -> int:
                 known[item.id] = now
                 continue
             if dry_run:
-                print("\n" + format_listing(item, load_info(item)))
+                info = load_info(item)
+                photos = f"\n📷 фото: {min(len(info.photos), MAX_PHOTOS)} из {len(info.photos)}" if info else ""
+                print("\n" + format_listing(item, info) + photos)
                 continue
             if budget <= 0:
                 print("…лимит сообщений за прогон исчерпан, остальное в следующий раз")
                 break
-            text = format_listing(item, load_info(item))  # без деталей, если страница объявления не открылась
             try:
-                tg_send(text)
+                send_listing(item)
             except Exception as e:  # noqa: BLE001
                 print(f"❌ Telegram: {e}", file=sys.stderr)
                 break
@@ -1006,7 +1078,7 @@ def send_samples() -> None:
         except Exception as e:  # noqa: BLE001
             print(f"❌ {SOURCE_LABELS[source]}: {e}")
             continue
-        tg_send(format_listing(items[0], load_info(items[0])))
+        send_listing(items[0])
         print(f"✔ {SOURCE_LABELS[source]}: отправил {items[0].id}")
         time.sleep(1.1)
 

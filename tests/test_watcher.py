@@ -105,6 +105,18 @@ class DetailTests(unittest.TestCase):
         i = info("Celková mesačná platba je 1 075 € + jednorázovy depozit + jednorazová provízia pre RK.", "815 €")
         self.assertEqual((i.deposit_mentioned, i.deposit, i.commission), (True, None, None))
 
+    def test_photos(self):
+        tr = watcher.parse_topreality_detail(read("topreality_detail.html")).photos
+        self.assertEqual(tr[0], "https://www.topreality.sk/topfoto/"
+                                "prenajom-2-izb-byt-s-balkonom-pri-hrade-kratka-ul-ba-stare-mesto-expis-real-d1-946-9466369_1.jpg")
+        self.assertTrue(len(tr) > 5 and tr[4].endswith("-9466369_5.jpg"))
+        bz = watcher.parse_bazos_detail(read("bazos_detail.html")).photos
+        self.assertEqual(bz[:2], ["https://www.bazos.sk/img/1/190/197650190.jpg", "https://www.bazos.sk/img/2/190/197650190.jpg"])
+        # у Nehnuteľnosti фото в экранированном JSON, первый блок "media" — само объявление
+        page = ('self.__next_f.push([1,"{\\"media\\":{\\"photos\\":[{\\"largeUrl\\":\\"https://img.x/a?st=1\\u0026ts=2\\"},'
+                '{\\"largeUrl\\":\\"https://img.x/b\\"}],\\"videos\\":[]},\\"media\\":{\\"photos\\":[{\\"largeUrl\\":\\"https://img.x/other\\"}]}}"])')
+        self.assertEqual(watcher.parse_nehnutelnosti_detail(page).photos, ["https://img.x/a?st=1&ts=2", "https://img.x/b"])
+
     def test_phrasings_from_real_listings(self):
         """Формулировки из 118 реальных объявлений, которые бот раньше читал неправильно."""
         def info(text, price="900 €", source="bazos", detail=None):
@@ -303,6 +315,23 @@ class RunTests(unittest.TestCase):
         self.assertEqual(len(self.sent), 1)
         self.assertIn("199999999", self.sent[0])
         self.assertNotIn("Первый платёж", self.sent[0])
+
+    def test_photos_go_first_and_never_block_text(self):
+        calls = []
+        info = watcher.Info(photos=["https://x/1.jpg", "https://x/2.jpg"])
+        item = watcher.Listing("bazos", "1", "Byt", "500 €", "", "https://x.sk/")
+        with mock.patch.object(watcher, "load_info", return_value=info), \
+                mock.patch.object(watcher, "tg_send_photos", side_effect=lambda u: calls.append(("photos", len(u))) or 2), \
+                mock.patch.object(watcher, "tg_send", side_effect=lambda t, preview=True: calls.append(("text", preview))):
+            watcher.send_listing(item)
+        self.assertEqual(calls, [("photos", 2), ("text", False)])  # альбом, потом текст без превью ссылки
+
+        calls.clear()
+        with mock.patch.object(watcher, "load_info", return_value=info), \
+                mock.patch.object(watcher, "tg_send_photos", side_effect=RuntimeError("Telegram: bad photo")), \
+                mock.patch.object(watcher, "tg_send", side_effect=lambda t, preview=True: calls.append(("text", preview))):
+            watcher.send_listing(item)
+        self.assertEqual(calls, [("text", True)])  # фото сломались — текст всё равно ушёл, с превью
 
     def test_max_price_filter(self):
         with mock.patch.object(watcher, "MAX_PRICE", 901.0):
