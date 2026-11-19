@@ -155,6 +155,11 @@ class DetailTests(unittest.TestCase):
         self.assertEqual(watcher.rooms_from("3 iz byt po rekonštrukcii"), "3-izb")
         self.assertEqual(info("Prenajmem zariadenú izbu v 4 izbovom byte").rooms, "Комната в квартире")
         self.assertTrue(info("SHARK REAL – VÁŠ PARTNER V OBLASTI REALÍT").agency)
+        # риелтор, подписанный именем: "majiteľ prenajíma", но рядом провизия — это агентство
+        self.assertTrue(info("Majiteľ prenajíma 2-izbový byt. Provízia RK 500 €.").agency)
+        self.assertFalse(info("Majiteľ prenajíma 2-izbový byt, bez provízie.").agency)
+        self.assertIsNone(info("Prenajmem byt. Volajte Peter.").agency)  # просто имя — не угадываем
+        self.assertFalse(info("Nie som RK, provízia RK sa neplatí.").agency)
         self.assertFalse(info("Ako majiteľ nehnuteľnosti Vám ponúkame byt", detail=watcher.Detail(agency=True)).agency)
         self.assertIn("Žiline", info("Prenájom 2-izbového bytu v Žiline").warning)
         self.assertTrue(watcher.WANTED_RE.search("Hľadám prenájom nepriechodnej izby"))

@@ -701,13 +701,16 @@ def analyze(item: Listing, d: Detail) -> Info:
     elif re.search(r"klimatiz|klím|\bklima\b|air[- ]?condition", text, re.I):
         info.aircon = True
 
-    if OWNER_RE.search(text):
+    if OWNER_RE.search(text):  # "bez RK", "nie som RK", "priamo od majiteľa" — хозяин сам
         info.agency = False
     elif info.agency is None:
-        if NO_AGENCY_RE.search(text):
-            info.agency = False
-        elif AGENCY_TEXT_RE.search(text) or re.search(COMMISSION_KW, text, re.I):
+        # Риелтор, подписанный просто именем, тоже пишет "majiteľ prenajíma byt", но рядом "provízia RK" —
+        # признаки агентства важнее слабых слов хозяина
+        positive = NO_COMMISSION_RE.sub(" ", text)  # "bez provízie" — не признак агентства
+        if AGENCY_TEXT_RE.search(positive) or re.search(COMMISSION_KW, positive, re.I):
             info.agency = True
+        elif NO_AGENCY_RE.search(text):
+            info.agency = False
 
     monthly_costs(item, d, text, info)
     info.persons_note = persons_note(text, info)
