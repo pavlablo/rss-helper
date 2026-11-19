@@ -268,6 +268,16 @@ class Detail:
     energies_included: bool | None = None
     deposit: int | None = None
     photos: list[str] = field(default_factory=list)  # полноразмерные фото по порядку галереи
+    dates: list[tuple[str, datetime]] = field(default_factory=list)  # ("добавлено", когда) — время по Братиславе
+
+
+def bratislava_time(utc: datetime) -> datetime:
+    """UTC -> Братислава: летом +2, зимой +1 (с последнего воскресенья марта до последнего воскресенья октября)."""
+    def last_sunday(month: int) -> datetime:
+        d = datetime(utc.year, month, 31, 1, tzinfo=timezone.utc)
+        return d - timedelta(days=(d.weekday() + 1) % 7)
+    summer = last_sunday(3) <= utc < last_sunday(10)
+    return (utc + timedelta(hours=2 if summer else 1)).replace(tzinfo=None)
 
 
 def page_text(el) -> str:
@@ -296,6 +306,10 @@ def parse_topreality_detail(page_html: str) -> Detail:
     if m:
         nums = sorted({int(n) for n in re.findall(rf"/topfoto/t/\d+/{m.group(2)}-(\d+)-\d+\.jpe?g", page_html)} | {1})
         d.photos = [f"https://www.topreality.sk/topfoto/{m.group(1)}_{n}.jpg" for n in nums]
+    m = re.search(r"Aktualizácia</span>\s*<strong>(\d{1,2})\.(\d{1,2})\.(\d{4})\s+(\d{1,2}):(\d{2})", page_html)
+    if m:  # уже по местному времени
+        dd, mm, yy, hh, mi = map(int, m.groups())
+        d.dates.append(("обновлено", datetime(yy, mm, dd, hh, mi)))
     return d
 
 
@@ -313,6 +327,11 @@ def parse_bazos_detail(page_html: str) -> Detail:
     if by_id:  # на странице бывают и чужие объявления — берём то, у которого больше всего фото
         lid, nums = max(by_id.items(), key=lambda kv: len(kv[1]))
         d.photos = [f"https://www.bazos.sk/img/{n}/{lid[-3:]}/{lid}.jpg" for n in sorted(nums)]
+    # "<h1 ...>Prenájom ...</h1><span class=velikost10> - [19.11. 2026]</span>": дата подачи или последнего поднятия
+    m = re.search(r"</h1>\s*<span[^>]*>\s*-\s*\[(\d{1,2})\.(\d{1,2})\.\s?(\d{4})\]", page_html, re.I)
+    if m:
+        dd, mm, yy = map(int, m.groups())
+        d.dates.append(("добавлено или поднято", datetime(yy, mm, dd)))
     return d
 
 
@@ -344,6 +363,13 @@ def parse_nehnutelnosti_detail(page_html: str) -> Detail:
     m = re.search(r'"media":\{"photos":\[(.*?)\]', raw)
     if m:
         d.photos = [u.replace("\\u0026", "&") for u in re.findall(r'"largeUrl":"([^"]+)"', m.group(1))]
+    # Первые даты на странице — у самого объявления: "publishedAt":"2026-11-18T23:10:33.000Z"
+    for key, label in (("publishedAt", "добавлено"), ("updatedAt", "обновлено")):
+        m = re.search(rf'"{key}":"(\d{{4}})-(\d\d)-(\d\d)T(\d\d):(\d\d)', raw)
+        if m:
+            d.dates.append((label, bratislava_time(datetime(*map(int, m.groups()), tzinfo=timezone.utc))))
+    if len(d.dates) == 2 and d.dates[1][1] - d.dates[0][1] < timedelta(hours=1):
+        d.dates.pop()  # "обновлено" через минуту после публикации — это не обновление
     return d
 
 
@@ -551,6 +577,8 @@ class Info:
     street: str = ""
     street_alt: str = ""            # в тексте другая улица, чем в поле сайта — покажем обе с "?"
     photos: list[str] = field(default_factory=list)
+    phones: list[str] = field(default_factory=list)  # только номера, которые продавец сам написал в тексте
+    dates: list[tuple[str, datetime]] = field(default_factory=list)
     persons_note: str = ""          # "вдвоём 800 €", если цена зависит от числа жильцов
     warning: str = ""
     aircon: bool | None = None
@@ -668,6 +696,23 @@ def monthly_costs(item: Listing, d: Detail, text: str, info: Info) -> None:
         info.first_months = 2 if m.group(1) in ("dva", "2") else 3
 
 
+# Словацкие номера: мобильные "0905 795 736", "+421 944 040 684", "0907714764" и братиславские "02/123 4567".
+# Кнопку "zobraz číslo" бот не нажимает: сайты прячут номер от массового сбора, берём только написанное в тексте.
+PHONE_RE = re.compile(r"(?<![\d/])(?:\+421|00421|0)\s?(?:9\d{2}[\s/-]?\d{3}[\s/-]?\d{3}|2[\s/-]?\d{4}[\s/-]?\d{4}"
+                      r"|2[\s/-]?\d{3}[\s/-]?\d{3,4})(?!\d)")
+
+
+def phones_from(text: str) -> list[str]:
+    found: list[str] = []
+    for raw in PHONE_RE.findall(text):
+        digits = re.sub(r"\D", "", raw)
+        digits = "0" + digits[3:] if digits.startswith("421") else "0" + digits[5:] if digits.startswith("00421") else digits
+        nice = f"{digits[:4]} {digits[4:7]} {digits[7:]}" if digits.startswith("09") else f"02/{digits[2:6]} {digits[6:]}"
+        if nice not in found:
+            found.append(nice)
+    return found[:2]
+
+
 def persons_note(text: str, info: Info) -> str:
     """Цена зависит от числа жильцов: бот считает по первой цене, второй вариант показываем рядом."""
     m = re.search(rf"druh\w+\s+osob\w*\s*(?:plus|\+)\s*{AMOUNT}", text, re.I)  # "druhá osoba plus 50,-€"
@@ -706,7 +751,7 @@ def analyze(item: Listing, d: Detail) -> Info:
         if not rooms_from(item.title) and ("," in in_text and rooms[:1] == in_text[:1] or "gars" in in_text.lower()):
             rooms = in_text  # "Kategória: 2 izbový", а в тексте "2,5 izbový byt" или "2-garsónku"
     city = OTHER_CITY_RE.search(head)
-    info = Info(rooms=rooms, photos=d.photos,
+    info = Info(rooms=rooms, photos=d.photos, dates=d.dates, phones=phones_from(d.text),
                 street=(canonical_street(d.street) or d.street if d.street else "")
                 or street_from(item.title) or street_from(d.text),
                 warning=f"похоже, это не Братислава ({city.group(0)})" if city else "",
@@ -921,6 +966,19 @@ def price_line(item: Listing, info: Info | None) -> str:
     return line + (f" · {info.persons_note}" if info.persons_note else "")
 
 
+OLD_AFTER_DAYS = 3  # объявление старше — помечаем, что оно не свежее
+
+
+def dates_line(dates: list[tuple[str, datetime]], now: datetime | None = None) -> str:
+    """'🕒 добавлено 18.11. 23:10 · обновлено 19.11. 02:22', для старых — '⏳ старое объявление: ... (12 дн. назад)'."""
+    now = now or bratislava_time(datetime.now(timezone.utc))
+    parts = [f"{label} {dt:%d.%m.}" + ("" if dt.hour == dt.minute == 0 else f" {dt:%H:%M}") for label, dt in dates]
+    age = (now.date() - dates[0][1].date()).days  # по первой (самой ранней) дате
+    if age >= OLD_AFTER_DAYS:
+        return f"⏳ старое объявление: {' · '.join(parts)} ({age} дн. назад)"
+    return "🕒 " + " · ".join(parts)
+
+
 def format_listing(item: Listing, info: Info | None = None) -> str:
     e = html.escape
     rooms = f"{e(info.rooms)} · " if info and info.rooms else ""
@@ -961,6 +1019,8 @@ def format_listing(item: Listing, info: Info | None = None) -> str:
             else:
                 fee = f"провизия {eur(info.commission)} €"
             lines.append(f"🧑‍💼 С риелтором{name}, {fee}")
+        # Номер — только если продавец написал его в тексте; иначе он за кнопкой на сайте
+        lines.append("📞 " + (", ".join(info.phones) if info.phones else "номер на сайте объявления"))
 
         # "≈ N мес." — в объявлении написано "1 mesačný nájom" без суммы, считаем от аренды
         def label(name: str, months: float | None) -> str:
@@ -977,6 +1037,8 @@ def format_listing(item: Listing, info: Info | None = None) -> str:
         prefix = "от " if any(n is None for n, _ in parts) else "≈ " if info.deposit_months or info.commission_months else ""
         breakdown = " + ".join(f"{eur(n)} ({lbl})" for n, lbl in parts)
         lines.append(f"💰 Первый платёж: {prefix}{eur(total)} € = {breakdown}")
+        if info.dates:
+            lines.append(dates_line(info.dates))
 
     lines.append(f'🔗 <a href="{e(item.url, quote=True)}">Открыть на {e(SOURCE_LABELS[item.source])}</a>')
     return "\n".join(lines)

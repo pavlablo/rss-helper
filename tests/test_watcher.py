@@ -6,6 +6,7 @@ import os
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -116,6 +117,27 @@ class DetailTests(unittest.TestCase):
         page = ('self.__next_f.push([1,"{\\"media\\":{\\"photos\\":[{\\"largeUrl\\":\\"https://img.x/a?st=1\\u0026ts=2\\"},'
                 '{\\"largeUrl\\":\\"https://img.x/b\\"}],\\"videos\\":[]},\\"media\\":{\\"photos\\":[{\\"largeUrl\\":\\"https://img.x/other\\"}]}}"])')
         self.assertEqual(watcher.parse_nehnutelnosti_detail(page).photos, ["https://img.x/a?st=1&ts=2", "https://img.x/b"])
+
+    def test_phones_and_dates(self):
+        self.assertEqual(watcher.phones_from("Volajte 0905 795 736 alebo +421 944 040 684, 0907714764. Cena 1 075 €, 52 m2"),
+                         ["0905 795 736", "0944 040 684"])  # максимум 2, цены и площади — не номера
+        self.assertEqual(watcher.phones_from("Tel.: 02/2092 4186"), ["02/2092 4186"])
+        self.assertEqual(watcher.phones_from("Byt 3 / 8 poschodie, 600 €"), [])
+
+        tr = watcher.parse_topreality_detail(read("topreality_detail.html")).dates
+        self.assertEqual(tr[0][0], "обновлено")
+        bz = watcher.parse_bazos_detail(read("bazos_detail.html")).dates
+        self.assertEqual(bz[0][0], "добавлено или поднято")
+
+        now = datetime(2026, 11, 19, 12, 0)
+        self.assertEqual(watcher.dates_line([("добавлено", datetime(2026, 11, 18, 23, 10)),
+                                             ("обновлено", datetime(2026, 11, 19, 2, 22))], now),
+                         "🕒 добавлено 18.11. 23:10 · обновлено 19.11. 02:22")
+        self.assertEqual(watcher.dates_line([("добавлено или поднято", datetime(2026, 11, 1))], now),
+                         "⏳ старое объявление: добавлено или поднято 01.11. (18 дн. назад)")
+        # UTC -> Братислава: зимой +1, летом +2
+        self.assertEqual(watcher.bratislava_time(datetime(2026, 11, 18, 22, 10, tzinfo=timezone.utc)), datetime(2026, 11, 18, 23, 10))
+        self.assertEqual(watcher.bratislava_time(datetime(2026, 7, 1, 22, 10, tzinfo=timezone.utc)), datetime(2026, 7, 2, 0, 10))
 
     def test_phrasings_from_real_listings(self):
         """Формулировки из 118 реальных объявлений, которые бот раньше читал неправильно."""
