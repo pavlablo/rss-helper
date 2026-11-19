@@ -9,21 +9,24 @@ Flat watcher: следит за новыми объявлениями об ар�
     python watcher.py --dry-run    # показать, что было бы отправлено, ничего не сохраняя
     python watcher.py --chat-id    # подсказать chat_id (нужен TELEGRAM_BOT_TOKEN)
     python watcher.py --test       # отправить тестовое сообщение в Telegram
+    python watcher.py --sample     # прислать по одному свежему объявлению с каждого сайта (seen.json не трогает)
 """
 from __future__ import annotations
 
 import argparse
 import html
+import itertools
 import json
 import os
 import re
 import sys
 import time
-from dataclasses import dataclass
+import unicodedata
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
-from urllib.parse import urljoin
+from urllib.parse import quote_plus, urljoin
 
 import requests
 from bs4 import BeautifulSoup
@@ -248,6 +251,488 @@ PARSERS: dict[str, Callable[[str], list[Listing]]] = {
 
 
 # ---------------------------------------------------------------------------
+# Страница объявления: улица, комнаты, клима, риелтор, депозит, провизия
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Detail:
+    text: str = ""              # заголовок + описание, по нему ищем всё остальное
+    street: str = ""
+    rooms: str = ""
+    agency: bool | None = None  # True = риелтор, False = без риелтора, None = не понятно
+    agency_name: str = ""
+    energies: int | None = None             # из отдельного поля сайта, если есть
+    energies_included: bool | None = None
+    deposit: int | None = None
+
+
+def page_text(el) -> str:
+    """Текст с переносами строк между блоками: регулярки не перескакивают через абзацы."""
+    if el is None:
+        return ""
+    lines = (clean(line) for line in el.get_text("\n").splitlines())
+    return "\n".join(line for line in lines if line)
+
+
+def parse_topreality_detail(page_html: str) -> Detail:
+    soup = BeautifulSoup(page_html, "html.parser")
+    d = Detail(text="\n".join([page_text(soup.select_one("h1")), page_text(soup.select_one(".description"))]))
+    for li in soup.select(".properties li"):
+        t = clean(li.get_text(" "))
+        if t.startswith("Ulica "):
+            d.street = t[len("Ulica "):]
+        elif t.startswith("Kategória "):
+            d.rooms = rooms_from(t)
+    agency = soup.select_one(".a-agency")
+    if agency:
+        d.agency, d.agency_name = True, clean(agency.get_text())
+    return d
+
+
+def parse_bazos_detail(page_html: str) -> Detail:
+    soup = BeautifulSoup(page_html, "html.parser")
+    d = Detail(text="\n".join([page_text(soup.select_one("h1")), page_text(soup.select_one(".popisdetail"))]))
+    for row in soup.select("td.listadvlevo tr"):
+        cells = [clean(c.get_text(" ")) for c in row.select("td")]
+        if len(cells) >= 2 and cells[0].startswith("Meno") and AGENCY_NAME_RE.search(cells[1]):
+            d.agency, d.agency_name = True, cells[1].replace(" ,", ",")
+    return d
+
+
+def parse_nehnutelnosti_detail(page_html: str) -> Detail:
+    soup = BeautifulSoup(page_html, "html.parser")
+    d = Detail(text="\n".join([page_text(soup.select_one("h1")), page_text(soup.select_one("#detail-description"))]))
+    # Данные объявления лежат в Next.js-скриптах как экранированный JSON.
+    raw = page_html.replace('\\"', '"')
+    m = re.search(r'"isWithinGracePeriod":\w+,"location":\{([^{}]*)', raw)
+    if m:
+        street = re.search(r'"street":"([^"]+)"', m.group(1))
+        number = re.search(r'"streetNumber":"([^"]+)"', m.group(1))
+        if street:
+            d.street = street.group(1) + (f" {number.group(1)}" if number else "")
+    m = re.search(r'"advertiser":\{"id":"[^"]*","name":"([^"]*)".*?"type":"(\w+)"(?:,"agency":\{"id":"[^"]*","name":"([^"]*)")?', raw)
+    if m:
+        d.agency = m.group(2) == "AGENT"
+        d.agency_name = (m.group(3) or m.group(1)).replace("\\u0026", "&")
+    # Первый блок цены на странице — у самого объявления, дальше идут похожие.
+    m = re.search(r'"powerCosts":\{"value":"([^"]*)","areIncluded":(true|false)', raw)
+    if m:
+        d.energies_included = m.group(2) == "true" or None
+        if m.group(1):
+            d.energies = money(re.match(r"[\d  .]+", m.group(1)).group(0).strip())
+    m = re.search(r'"label":"Depozit[^"]*","value":"([\d  .]+)', raw)
+    if m:
+        d.deposit = money(m.group(1).strip())
+    return d
+
+
+DETAIL_PARSERS: dict[str, Callable[[str], Detail]] = {
+    "topreality": parse_topreality_detail,
+    "bazos": parse_bazos_detail,
+    "nehnutelnosti": parse_nehnutelnosti_detail,
+}
+
+# Сумма: "1 075 €", "900,- EUR", "780€", "1.050 eur", "800.-€", "1.100,- eur"
+AMOUNT = r"(\d{1,3}(?:[  .]\d{3})+|\d+)(?:,\d{1,2}|[,.]-)?\s*(?:€|eur\b)"
+# Кратность месячной платы: "1x", "1 mesačný", "jedného nájmu", "dvojnásobok", "2 nájmy", "1/2"
+MULT_WORD = r"(\d/\d|\d|jedn(?!or[aá]z)\w*|dvoj\w*|dvoch|dva|dve|troj\w*|troch|tri|polovic\w*)"  # "jednorázový" = разовый
+# Чего месяц. По умолчанию — аренда вместе с энергиями (так в Братиславе считают депозит и почти всегда провизию),
+# чистая аренда — только если прямо написано "čistého nájmu" / "nájmu bez energií"
+MONTH_UNIT = (r"(?:z\s+)?(?:celkov\w+\s+|komplet\w*\s+)?(?:celého\s+)?(?P<net>čist\w+\s+)?(?:mesačn\w+\s+)?"
+              r"(?:nájm\w*|nájomn\w*|platb\w*|prenájm\w*|mesiac\w*)(?P<net2>\s+bez\s+energi\w*)?")
+DEPOSIT_KW = r"(?:kauci|depozit|zábezpek|zabezpek)\w*"
+COMMISSION_KW = (r"(?:provízi\w*|provizi\w*|odmen\w*\s+(?:pre\s+)?(?:RK|realit\w*|sprostredkovate\w*)|"
+                 r"úhrad\w*\s+pre\s+(?:RK|realit\w*)|"
+                 r"poplat\w*\s+(?:pre\s+)?(?:RK|realit\w*))")
+COMMISSION_FOR_RK = rf"{AMOUNT}\s+(?:pre|za)\s+(?:RK|realitn\w+\s+kancel\w*|sprostredk\w*)"  # "a 600 Eur pre RK"
+NO_COMMISSION_RE = re.compile(
+    r"bez\s+provízi|neplatí\w*\s+(?:\w+\s+){0,2}?provízi|provízi\w*\s+(?:sa\s+)?neplatí|"
+    r"(?:odmen|provízi)\w*\s+(?:\w+\s+){0,2}?hradí\s+(?:majite|prenajímate)|\bno\s+(?:agency\s+)?(?:commission|fee)",
+    re.I)
+AGENCY_NAME_RE = re.compile(r"\bRK\b|realit|kancel|s\.\s?r\.\s?o|maklér|broker|\breal\b|reality", re.I)
+# Сдаёт сам владелец — сильнее, чем "агент" в профиле сайта
+OWNER_RE = re.compile(
+    r"bez\s+(?:RK|realitn\w+|realitky|sprostredkovate\w*)|nie\s+(?:som|sme)\s+(?:RK|realit\w*)|RK\s+nevola\w*|"
+    r"ako\s+majite\w+|as\s+the\s+(?:property\s+)?owner|priamo\s+od\s+majite\w+",
+    re.I)
+NO_AGENCY_RE = re.compile(
+    OWNER_RE.pattern + r"|súkromn\w+\s+(?:osob\w*|inzer\w*|majite\w*)|od\s+majite\w+|majite\w*\s+(?:bytu\s+)?(?:ponúka|prenajíma)",
+    re.I)
+AGENCY_TEXT_RE = re.compile(r"\bRK\b|realitn\w+\s+kancel|maklér|realít\b|\b[A-ZÁ-Ž]{3,}\s+REAL(?:ITY)?\b")
+# Объявление "ищу квартиру" — не предложение, не шлём
+WANTED_RE = re.compile(r"^\W*(?:hľadám|hladam|hľadáme|hladame|kúpim|vymením)\b", re.I)
+ROOM_ONLY_RE = re.compile(
+    r"\b(?:prenaj\w+|prenájom|ponúk\w+)\s+(?:\w+\s+){0,2}?izb[uay]\b(?!\s*(?:byt|\d))|^\W*izba\b|"
+    r"\bizb[au]\s+v\s+(?:\w+\s+){0,3}?\d?\s*-?\s*izbov\w+\s+byt", re.I | re.M)
+OTHER_CITY_RE = re.compile(
+    r"\bv\s+(Žiline|Trnave|Nitre|Košiciach|Trenčíne|Banskej\s+Bystrici|Prešove|Martine|Senci|Pezinku|Malackách|Šamoríne)\b")
+# Районы Братиславы: "Ružinov" нельзя превращать в улицу "Ružinovská"
+DISTRICTS = ["ruzinov", "petrzalk", "karlov", "dubravk", "lamac", "devin", "rac", "vajnor", "vrakun", "biskupic",
+             "jarovc", "rusovc", "cunov", "nove", "stare", "novom", "starom", "slnecnic", "nivy", "mesto", "meste"]
+
+
+def money(s: str) -> int:
+    return int(re.sub(r"[  .]", "", s))
+
+
+def mult(word: str) -> float:
+    w = word.lower()
+    if "/" in w:
+        a, b = w.split("/")
+        return int(a) / int(b)
+    if w.isdigit():
+        return int(w)
+    if w.startswith("polovic"):
+        return 0.5
+    return 1 if w.startswith("jedn") else 2 if w.startswith("dv") else 3
+
+
+def rooms_from(text: str) -> str:
+    if re.search(r"\b(?:2|dvoj)\s*-?\s*gar[sz]ón|dvojgar[sz]ón", text, re.I):
+        return "Dvojgarsónka"
+    if re.search(r"gar[sz]ón|garsonk", text, re.I):
+        return "Garsónka"
+    m = re.search(r"(\d(?:[,.]5)?)\s*[-‐–]?\s*(?:izb|iz\.|iz\s+byt|i\s+byt\b)", text, re.I)
+    return f"{m.group(1).replace('.', ',')}-izb" if m else ""
+
+
+STREETS_FILE = Path(__file__).with_name("streets.txt")  # все улицы Братиславы из OpenStreetMap
+_streets: dict[str, str] | None = None
+
+
+def fold(s: str) -> str:
+    return unicodedata.normalize("NFKD", s.lower()).encode("ascii", "ignore").decode()
+
+
+def canonical_street(raw: str) -> str | None:
+    """'Bajkalskej' -> 'Bajkalská', 'Drotárskej' -> 'Drotárska cesta'. None, если такой улицы нет.
+    Google Maps косвенный падеж не находит, поэтому ищем по началу слов в справочнике."""
+    global _streets
+    if _streets is None:
+        names = STREETS_FILE.read_text(encoding="utf-8").splitlines() if STREETS_FILE.exists() else []
+        _streets = {fold(n): n for n in names if n.strip()}
+    if not _streets:
+        return raw
+    m = re.fullmatch(r"(.*?)(?:\s+(\d+[a-zA-Z]?(?:/\d+)?))?", raw.strip())
+    name, number = m.group(1), m.group(2)
+    words = fold(name).split()
+    if not words:
+        return None
+    if " ".join(words) in _streets:
+        found = _streets[" ".join(words)]
+    else:
+        if any(re.fullmatch(stem + r"\w{0,3}", words[0]) for stem in DISTRICTS):
+            return None  # "Ružinove", "Petržalke" — район, а не улица
+
+        def word_ok(a: str, b: str) -> bool:  # разные окончания одного слова: bajkalskej / bajkalska
+            p = len(os.path.commonprefix([a, b]))
+            return p >= min(4, len(b) - 1) and p >= len(a) - 4 and p >= len(b) - 3 or a == b
+        best = None
+        for key, n in _streets.items():
+            kw = key.split()
+            extra = kw[len(words):]
+            if len(kw) < len(words) or not all(word_ok(a, b) for a, b in zip(words, kw)):
+                continue
+            if extra and extra not in (["cesta"], ["ulica"], ["namestie"], ["nabrezie"]):
+                continue
+            score = (len(extra), sum(len(os.path.commonprefix([a, b])) for a, b in zip(words, kw)) * -1)
+            if best is None or score < best[0]:
+                best = (score, n)
+        if not best:
+            return None
+        found = best[1]
+    return f"{found} {number}" if number else found
+
+
+STREET_WORD = r"[A-ZÁ-Ža-zá-ž][\w\-]+"
+STREET_PATTERNS = [
+    r"Ulica:\s*([^\n,]{3,40})",
+    # "na ul. Znievska", "ulica FIALOVÁ", "ul. Tomášikova 9/10 posch." (9/10 — этаж, не номер дома)
+    # Название с заглавной буквы: не "ulica tichšie bývanie", не "ulica na Hradnom kopci"
+    rf"\bul(?:ica|\.)\s*:?\s+([A-ZÁ-Ž][\w\-]+(?:\s+{STREET_WORD}){{0,2}}(?:\s+\d+[a-z]?(?:/\d+)?(?![\d/]|\s*(?:posch|p\.|NP)))?)",
+    rf"\b({STREET_WORD})\s+ul\.",                                                                  # "Donnerova ul."
+    r"\b([A-ZÁ-Ž][\w\-]+\s+(?i:cesta|námestie))\b",                                               # "TRNAVSKÁ CESTA"
+    r"\b([A-ZÁ-Ž][\w\-]+)\s+(?i:ulica)\b",                                                        # "Labutia ulica"
+    r"na\s+ulici\s+([A-ZÁ-Ž][\w.\-]*(?:\s+[A-ZÁ-Ža-z][\w.\-]*){0,2}?)(?=\s*[,.\n]|\s+v\s|\s+\d)",
+    r"\b(?:na|pri|v)\s+((?:[A-ZÁ-Ž][\w\-]+\s+){0,2}?[A-ZÁ-Ž][\w\-]+)\s+(?:ul\.|ulici|ulica|ceste|cesty|námestí)",
+    r"\bna\s+([A-ZÁ-Ž][\w\-]+(?:skej|ckej|ovej|nej|ej))\b",                                       # "garsónka na Bajkalskej"
+]
+# Только фразы, где улица — адрес самой квартиры ("bytový dom na Vrakúnskej ulici"), а не "pri Trnavskej ceste"
+FLAT_STREET_PATTERNS = STREET_PATTERNS[:3] + [
+    STREET_PATTERNS[5],
+    r"\bna\s+((?:[A-ZÁ-Ž][\w\-]+\s+){0,2}?[A-ZÁ-Ž][\w\-]+)\s+(?:ul\.|ulici)",
+]
+
+
+def streets_in(text: str, patterns: list[str] = STREET_PATTERNS) -> list[str]:
+    """Все улицы из текста по порядку правил (только те, что реально есть в Братиславе)."""
+    found = []
+    for p in patterns:
+        for m in re.finditer(p, text):
+            words = clean(m.group(1)).split()
+            number = words.pop() if len(words) > 1 and re.fullmatch(r"\d+[a-z]?(?:/\d+)?", words[-1]) else None
+            for n in range(len(words), 0, -1):  # "Fialová v Petržalke" -> "Fialová v" -> "Fialová"
+                street = canonical_street(" ".join(words[:n]))
+                if street:
+                    found.append(f"{street} {number}" if number else street)
+                    break
+    return found
+
+
+def street_from(text: str, patterns: list[str] = STREET_PATTERNS) -> str:
+    found = streets_in(text, patterns)
+    return found[0] if found else ""
+
+
+def sentences(text: str) -> list[str]:
+    return re.split(r"[!?\n]|\.\s+(?=[A-ZÁ-Ž])", text)  # "t.j. 3 x" и "ul. Znievska" не режем
+
+
+def find_part(text: str, keyword: str, rent: int | None, total: int | None,
+              commission: bool = False) -> tuple[bool, int | None, float | None]:
+    """(упомянут ли, сумма, во сколько месяцев) для депозита или провизии.
+    Месяцы != None — сумма посчитана из "1 mesačný nájom", а не написана в объявлении."""
+    if not re.search(keyword, text, re.I) and not (commission and re.search(COMMISSION_FOR_RK, text, re.I)):
+        return False, None, None
+    if commission:
+        m = re.search(COMMISSION_FOR_RK, text, re.I)  # "Nájom, depozit a 600 Eur pre RK"
+        if m:
+            return True, money(m.group(1)), None
+    # "Depozit: 780 €", "vratná kaucia 1 050 €" (но не "depozit a 600 Eur pre RK")
+    m = re.search(rf"{keyword}[^.!?\n\d]{{0,60}}?{AMOUNT}(?!\s+(?:pre|za)\s+(?:RK|realit|sprostred))", text, re.I)
+    if m:
+        return True, money(m.group(1)), None
+    for s in sentences(text):
+        if not re.search(keyword, s, re.I):
+            continue
+        # "depozit a provízia RK vo výške celkového mesačného nájmu", "kaucia vo výške dvoch nájmov",
+        # "Depozit vo výške 1x mesiac", "provízia v hodnote 1/2 z celého prenájmu"
+        m = re.search(rf"{keyword}[^!?\n\d]{{0,220}}?(?:(?:výšk\w*|hodnot\w*|:|=)\s*(?:{MULT_WORD}\s*[x×]?\s*-?\s*)?"
+                      rf"|{MULT_WORD}\s*[x×]?\s*-?\s*)(?:násob\w*\s+)?{MONTH_UNIT}", s, re.I)
+        if not m:  # "1x depozit", "1 mesačný depozit", "dvojnásobná kaucia"
+            m = re.search(rf"{MULT_WORD}\s*[x×]?\s*-?\s*(?:mesačn\w*\s+)?(?:vratn\w+\s+)?{keyword}", s, re.I)
+        if m:
+            k = next((mult(g) for g in m.groups()[:2] if g), 1)
+            gd = m.groupdict()
+            base = (rent or total) if gd.get("net") or gd.get("net2") else (total or rent)
+            if base:
+                return True, round(k * base), k
+        # "nájomné, kaucia a provízia, t.j. 3 x 900,- EUR": каждая часть по 900
+        m = re.search(rf"\d\s*[x×]\s*{AMOUNT}", s, re.I)
+        if m:
+            return True, money(m.group(1)), None
+    return True, None, None
+
+
+@dataclass
+class Info:
+    rooms: str = ""
+    street: str = ""
+    street_alt: str = ""            # в тексте другая улица, чем в поле сайта — покажем обе с "?"
+    persons_note: str = ""          # "вдвоём 800 €", если цена зависит от числа жильцов
+    warning: str = ""
+    aircon: bool | None = None
+    agency: bool | None = None
+    agency_name: str = ""
+    rent: int | None = None
+    energies: int | None = None
+    energies_state: str = "none"    # amount / included / unknown ("+ energie" без суммы) / none (ни слова)
+    extras: list[tuple[str, int]] = field(default_factory=list)  # обязательные доплаты: парковка, интернет
+    total_stated: int | None = None  # "Spolu: 1 075 €/mesiac" из описания
+    monthly: int | None = None       # всё вместе в месяц
+    first_months: int = 1            # "nájomné na dva mesiace vopred"
+    deposit: int | None = None
+    deposit_mentioned: bool = False
+    deposit_months: float | None = None   # сумма посчитана как N месяцев, а не написана
+    commission: int | None = None
+    commission_mentioned: bool = False
+    commission_months: float | None = None
+
+
+ENERGIES_KW = r"(?:energi\w*|prevádzkov\w+\s+náklad\w*|náklad\w*\s+na\s+bývanie|poplatk\w*(?:\s+za\s+služb\w*)?)"
+ENERGIES_INCLUDED_RE = re.compile(
+    r"vrátane\s+(?:[\w,]+\s+){0,4}?energi|energi\w*\s+(?:sú\s+)?(?:v\s+cene|zahrnut|započítan)|"
+    r"v\s+cene\s+(?:nájmu\s+|nájomného\s+)?(?:sú\s+)?(?:aj\s+|už\s+)?(?:všetky\s+)?energi|\bvč\.?\s+energi|\bs\s+energiami|"
+    r"náklady\s*(?:\([^)]*\))?\s*sú\s+v\s+cene|(?:elektrina|energie|služby)[^.\n]{0,40}?sú\s+v\s+cene|všetko\s+v\s+cene|"
+    r"utilit\w*[^.\n]{0,60}?included|including\s+utilities",
+    re.I)
+ENERGIES_UNKNOWN_RE = re.compile(
+    r"(?:\+|plus)\s+(?:[\w.]+\s+){0,4}?energi|\+\s*(?:záloh\w*\s+(?:za\s+)?)?energi|\+\s*E\b|"
+    r"energie\s+(?:sa\s+)?(?:platia|hradia)\s+(?:zvlášť|samostatne)", re.I)
+EXTRAS = [("парковка", r"parkova\w*|garáž\w*|garážov\w*\s+stoj\w*"), ("интернет/ТВ", r"internet\w*|káblov\w*\s+TV")]
+OPTIONAL_RE = re.compile(r"možn|osobitne|volite|príplat|záuj|nie\s*je\s+podmienk|nieje\s+podmienk|individuáln|doprenaj", re.I)
+RENT_RE = re.compile(
+    rf"(?:mesačn\w+\s+nájom\w*|nájomné|cena\s+(?:mesačného\s+)?(?:prenájmu|nájmu|nájomného)|\bnájom)(?:\s+na\s+mesiac)?"
+    rf"(?P<gap>(?:[^\n\d€.]|\d\s*osob\w*){{0,70}}?)(?:je\s+)?[:–-]?\s*{AMOUNT}"
+    rf"|\bcena\s*:?\s*{AMOUNT}\s*(?:/\s*)?(?:mesiac|mesačne|mes\b)", re.I)
+
+
+def monthly_costs(item: Listing, d: Detail, text: str, info: Info) -> None:
+    """Аренда, энергии, обязательные доплаты и итог в месяц."""
+    info.rent = int(item.price_value) if item.price_value else None
+
+    m = re.search(rf"(?:spolu|cena\s+komplet|celkov\w+\s+(?:mesačn\w+\s+)?(?:platb|cen|sum|nájomn)\w*)[^.!?\n\d]{{0,30}}?{AMOUNT}",
+                  text, re.I)
+    if m:
+        info.total_stated = money(m.group(1))
+
+    # Аренда из текста: на bazos в поле цены пишут что угодно, а в тексте "Mesačný nájom ... je 1.100,- eur"
+    rent_m = RENT_RE.search(text)
+    rent_text = money(rent_m.group(2) or rent_m.group(3)) if rent_m else None
+    # "Cena prenájmu: 780€ / mesiac (vrátane energií...)" — только в той же строке, что и аренда
+    rent_line = text[rent_m.start():].split("\n")[0][:160] if rent_m else ""
+    rent_included = bool(ENERGIES_INCLUDED_RE.search(rent_line))
+    if rent_text and (info.rent is None or item.source == "bazos"
+                      or (info.total_stated == info.rent and rent_text < info.rent)):
+        info.rent = rent_text
+
+    in_price = re.search(r"\+\s*([\d\s]+)\s*€\s*energ", item.price)  # topreality: "580 €/mes. + 240 € energie"
+    if d.energies:
+        info.energies = d.energies
+    elif in_price:
+        info.energies = money(in_price.group(1).strip())
+    elif not d.energies_included and not rent_included:
+        for p in (rf"(?:\+|plus|–)\s*{AMOUNT}\s*(?:[\w/]+\s+){{0,3}}?(?:za\s+|na\s+)?energi",
+                  rf"{ENERGIES_KW}[^.!?\n\d]{{0,90}}?{AMOUNT}"):
+            for m in re.finditer(p, text, re.I):
+                # не "750 € vrátane energií pre jednu osobu, 800 € pre dve osoby"
+                # но "Prevádzkové náklady a služby vrátane internetu – 210 €" — это как раз энергии
+                if not (re.search(r"vrátane|v\s+cene", text[max(0, m.start() - 30):m.start()], re.I)
+                        or re.search(r"osob", m.group(0), re.I)):
+                    info.energies = money(m.group(1))
+                    break
+            if info.energies:
+                break
+    if info.energies:
+        info.energies_state = "amount"
+    elif d.energies_included or rent_included or ENERGIES_INCLUDED_RE.search(text):
+        info.energies_state = "included"
+    elif ENERGIES_UNKNOWN_RE.search(text):
+        info.energies_state = "unknown"
+
+    # Доплаты с суммой в месяц. Обязательные идут в итог, "možnosť / v prípade záujmu" — нет
+    parts = sentences(text) + re.split(r"\n|(?<=[.!?])\s+", text)
+    optional = {label for label, kw in EXTRAS for s in parts if re.search(kw, s, re.I) and OPTIONAL_RE.search(s)}
+    found: list[tuple[str, int, bool]] = []  # (что, сколько, необязательная ли)
+    for line in re.split(r"\n|(?<=[.!?])\s+", text):
+        if re.search(r"energi|prevádzkov|náklad|poplat", line, re.I):
+            continue
+        for label, kw in EXTRAS:
+            # "... za 50 € mesačne" или строка прайса "• Parkovacie miesto: 50 EUR"
+            m = re.search(rf"(?:{kw})[^\n\d€]{{0,50}}?{AMOUNT}(?:\s*/?\s*(?:mes|mesačne|mesiac)|\s*$)", line, re.I)
+            if m and (label, money(m.group(1))) not in [(f[0], f[1]) for f in found]:
+                found.append((label, money(m.group(1)), bool(OPTIONAL_RE.search(line)) or label in optional))
+    found.sort(key=lambda f: f[2])  # обязательные первыми
+    for label, n, opt in found:
+        if not opt and label not in dict(info.extras):
+            info.extras.append((label, n))
+
+    base = (info.rent or 0) + (info.energies or 0)
+    if info.total_stated and info.rent:
+        # Раскладка должна сойтись со "Spolu": лишние подпункты ("Internet UPC 12 €" внутри 250 €) выкидываем,
+        # а "Vyhradené parkovacie miesto: 50 €" берём, даже если где-то рядом "možnosť ďalšieho miesta"
+        candidates = [(label, n) for label, n, _ in found]
+        fits = [list(c) for k in range(len(candidates), -1, -1) for c in itertools.combinations(candidates, k)
+                if base + sum(x for _, x in c) == info.total_stated and len({lbl for lbl, _ in c}) == len(c)]
+        if fits:
+            info.extras = fits[0]
+        elif base + sum(x for _, x in info.extras) < info.total_stated:
+            info.extras.append(("прочее", info.total_stated - base - sum(x for _, x in info.extras)))
+    computed = base + sum(n for _, n in info.extras)
+    info.monthly = info.total_stated or computed or None
+
+    m = re.search(r"(?:nájom\w*|nájm\w*)\s+(?:na|za)\s+(dva|2|tri|3)\s+mesiac\w*\s+vopred", text, re.I)
+    if m:
+        info.first_months = 2 if m.group(1) in ("dva", "2") else 3
+
+
+def persons_note(text: str, info: Info) -> str:
+    """Цена зависит от числа жильцов: бот считает по первой цене, второй вариант показываем рядом."""
+    m = re.search(rf"druh\w+\s+osob\w*\s*(?:plus|\+)\s*{AMOUNT}", text, re.I)  # "druhá osoba plus 50,-€"
+    if m:
+        return f"вдвоём +{eur(money(m.group(1)))} €"
+    lines = text.splitlines()
+    for who, label in ((r"(?:2|dve|dvoch)", "вдвоём"), (r"(?:1|jedn\w*)", "одному")):
+        for i, line in enumerate(lines):
+            # "800,- eur pre dve osoby", "250 € / 2 osoby", "680 €/mes. ... - 2 osoby", "Pri 2 osobách je cena 950"
+            m = (re.search(rf"{AMOUNT}[^\n\d€]{{0,50}}?(?:pre|na|/|-|–)\s*{who}\s+osob", line, re.I)
+                 or re.search(rf"(?:pri|pre)\s+{who}\s+osob\w*[^\n\d€]{{0,30}}?{AMOUNT}", line, re.I))
+            if not m:
+                continue
+            n = money(m.group(1))
+            # энергии: "Energie: 220 € / 1 osoba; 250 € / 2 osoby" или строка под заголовком "Energie a ... náklady:"
+            j = i - 1
+            while j >= 0 and re.match(r"\s*[-•–*]", lines[j]):  # поднимаемся по пунктам списка до заголовка
+                j -= 1
+            before = line[:m.start()] + (" " + lines[j] if j >= 0 and lines[j].rstrip().endswith(":") else "")
+            energy = bool(re.search(r"energi|náklad|poplat|služb", before, re.I)) and not re.search(
+                r"vrátane\s+(?:[\w,]+\s+){0,3}?energi", before, re.I)  # "750 € vrátane energií pre jednu osobu" — это цена
+            if n in ((info.energies,) if energy else (info.rent, info.monthly)):
+                continue  # эту сумму уже показали
+            return f"{label}{' энергии' if energy else ''} {eur(n)} €"
+    return ""
+
+
+def analyze(item: Listing, d: Detail) -> Info:
+    text = "\n".join([item.title, d.text])
+    head = "\n".join([item.title, d.text[:300]])
+    if ROOM_ONLY_RE.search(head):
+        rooms = "Комната в квартире"
+    else:
+        rooms = rooms_from(item.title) or d.rooms or rooms_from(item.details) or rooms_from(d.text)
+        in_text = rooms_from(d.text)
+        if not rooms_from(item.title) and ("," in in_text and rooms[:1] == in_text[:1] or "gars" in in_text.lower()):
+            rooms = in_text  # "Kategória: 2 izbový", а в тексте "2,5 izbový byt" или "2-garsónku"
+    city = OTHER_CITY_RE.search(head)
+    info = Info(rooms=rooms,
+                street=(canonical_street(d.street) or d.street if d.street else "")
+                or street_from(item.title) or street_from(d.text),
+                warning=f"похоже, это не Братислава ({city.group(0)})" if city else "",
+                agency=d.agency,
+                # "Realitné kancelárie SR" — заглушка порталов вместо названия агентства
+                agency_name="" if d.agency_name == "Realitné kancelárie SR" else d.agency_name)
+    if d.street:  # поле сайта: Poludníková, а в тексте только "bytového domu na Vrakúnskej ulici"
+        in_text = streets_in(d.text, FLAT_STREET_PATTERNS)
+        if in_text and fold(info.street.split()[0]) not in {fold(s.split()[0]) for s in in_text}:
+            info.street_alt = in_text[0]
+
+    if re.search(r"bez\s+klim|klimatiz\w*\s*:?\s*(?:nie\b|nie\s+je|nemá)|nemá\s+klim", text, re.I):
+        info.aircon = False
+    elif re.search(r"klimatiz|klím|\bklima\b|air[- ]?condition", text, re.I):
+        info.aircon = True
+
+    if OWNER_RE.search(text):
+        info.agency = False
+    elif info.agency is None:
+        if NO_AGENCY_RE.search(text):
+            info.agency = False
+        elif AGENCY_TEXT_RE.search(text) or re.search(COMMISSION_KW, text, re.I):
+            info.agency = True
+
+    monthly_costs(item, d, text, info)
+    info.persons_note = persons_note(text, info)
+    if d.deposit:
+        info.deposit_mentioned, info.deposit = True, d.deposit
+    else:
+        info.deposit_mentioned, info.deposit, info.deposit_months = find_part(
+            text, DEPOSIT_KW, info.rent, info.monthly)
+    if info.agency is False or NO_COMMISSION_RE.search(text):
+        info.commission_mentioned, info.commission = True, 0
+    else:
+        info.commission_mentioned, info.commission, info.commission_months = find_part(
+            text, COMMISSION_KW, info.rent, info.monthly, commission=True)
+    return info
+
+
+def load_info(item: Listing) -> Info | None:
+    try:
+        return analyze(item, DETAIL_PARSERS[item.source](fetch(item.url, attempts=2)))
+    except Exception as e:  # noqa: BLE001
+        print(f"⚠️ не удалось разобрать {item.url}: {e}", file=sys.stderr)
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Загрузка страниц
 # ---------------------------------------------------------------------------
 
@@ -319,13 +804,92 @@ def notify(text: str) -> None:
         print(f"❌ Telegram: {e}", file=sys.stderr)
 
 
-def format_listing(item: Listing) -> str:
+def months_str(m: float) -> str:
+    return f"{m:g}".replace(".", ",")  # 0.5 -> "0,5"
+
+
+def eur(n: int | None) -> str:
+    return "?" if n is None else f"{n:,}".replace(",", " ")
+
+
+def price_line(item: Listing, info: Info | None) -> str:
+    """"815 € аренда + 210 € энергии + 50 € парковка = 1 075 €/мес" — сразу видно, что входит в цену."""
+    if not info or info.rent is None:
+        return item.price
+    parts = [f"{eur(info.rent)} € аренда"]
+    if info.energies_state == "amount":
+        parts.append(f"{eur(info.energies)} € энергии")
+    parts += [f"{eur(n)} € {label}" for label, n in info.extras]
+    line = " + ".join(parts)
+    if len(parts) > 1 or info.total_stated not in (None, info.rent):
+        line += f" = {eur(info.monthly)} €/мес"
+    else:
+        line = f"{eur(info.rent)} €/мес"
+    line += {
+        "included": ", энергии включены",
+        "unknown": " + энергии (сумма не указана)",
+        "none": ", про энергии ничего не сказано",
+    }.get(info.energies_state, "")
+    return line + (f" · {info.persons_note}" if info.persons_note else "")
+
+
+def format_listing(item: Listing, info: Info | None = None) -> str:
     e = html.escape
-    lines = [f"🏠 <b>{e(item.title)}</b>", f"💶 {e(item.price)}"]
-    if item.location:
-        lines.append(f"📍 {e(item.location)}")
+    rooms = f"{e(info.rooms)} · " if info and info.rooms else ""
+    lines = [f"🏠 {rooms}<b>{e(item.title)}</b>", f"💶 {e(price_line(item, info))}"]
+
+    location = item.location
+    if info and info.street:
+        def link(street: str) -> str:
+            maps = "https://www.google.com/maps/search/?api=1&query=" + quote_plus(f"{street}, Bratislava")
+            return f'<a href="{e(maps, quote=True)}">{e(street)}</a>'
+        first, _, rest = location.partition(",")
+        if first.strip().lower()[:5] == info.street.lower()[:5]:  # улица уже есть в районе, не повторяем
+            location = rest.strip()
+        # Сайт и текст называют разные улицы — показываем обе, пусть человек проверит
+        street = f"{link(info.street)} или {link(info.street_alt)}?" if info.street_alt else link(info.street)
+        lines.append(f"📍 {street}" + (f" · {e(location)}" if location else ""))
+    elif location:
+        lines.append(f"📍 {e(location)}")
     if item.details:
         lines.append(f"📐 {e(item.details)}")
+
+    if info:
+        if info.warning:
+            lines.append(f"⚠️ {e(info.warning)}")
+        lines.append("❄️ Клима: " + {True: "есть", False: "нет", None: "не указано"}[info.aircon])
+        if info.agency is False:
+            lines.append("🙋 Без риелтора")
+        elif info.agency is None and not info.commission_mentioned:
+            lines.append("❔ Риелтор: не указано")
+        else:
+            name = f" ({e(info.agency_name)})" if info.agency_name else ""
+            if info.commission is None:
+                fee = "провизия не указана"
+            elif info.commission == 0:
+                fee = "провизию не платишь"
+            elif info.commission_months:
+                fee = f"провизия {months_str(info.commission_months)} мес. (≈ {eur(info.commission)} €)"
+            else:
+                fee = f"провизия {eur(info.commission)} €"
+            lines.append(f"🧑‍💼 С риелтором{name}, {fee}")
+
+        # "≈ N мес." — в объявлении написано "1 mesačný nájom" без суммы, считаем от аренды
+        def label(name: str, months: float | None) -> str:
+            return f"{name} ≈ {months_str(months)} мес." if months else name
+        month = ("1-й мес." if info.first_months == 1 else f"{info.first_months} мес. вперёд") + (
+            " без энергий" if info.energies_state in ("unknown", "none") else "")
+        parts = [(info.monthly * info.first_months if info.monthly else None, month),
+                 (info.deposit, label("депозит", info.deposit_months) if info.deposit_mentioned else "депозит не указан")]
+        if info.commission:
+            parts.append((info.commission, label("провизия", info.commission_months)))
+        elif info.commission is None and info.agency is not False:
+            parts.append((None, "провизия"))
+        total = sum(n for n, _ in parts if n)
+        prefix = "от " if any(n is None for n, _ in parts) else "≈ " if info.deposit_months or info.commission_months else ""
+        breakdown = " + ".join(f"{eur(n)} ({lbl})" for n, lbl in parts)
+        lines.append(f"💰 Первый платёж: {prefix}{eur(total)} € = {breakdown}")
+
     lines.append(f'🔗 <a href="{e(item.url, quote=True)}">Открыть на {e(SOURCE_LABELS[item.source])}</a>')
     return "\n".join(lines)
 
@@ -395,14 +959,18 @@ def run(dry_run: bool = False) -> int:
         new = [x for x in listings if x.id not in known]
         print(f"✔ {label}: на страницах {len(listings)}, новых {len(new)}")
         for item in reversed(new):  # сайты отдают сначала новые -> шлём в хронологическом порядке
+            if WANTED_RE.search(item.title):  # "Hľadám prenájom..." — человек ищет жильё, это не предложение
+                known[item.id] = now
+                continue
             if dry_run:
-                print("\n" + format_listing(item))
+                print("\n" + format_listing(item, load_info(item)))
                 continue
             if budget <= 0:
                 print("…лимит сообщений за прогон исчерпан, остальное в следующий раз")
                 break
+            text = format_listing(item, load_info(item))  # без деталей, если страница объявления не открылась
             try:
-                tg_send(format_listing(item))
+                tg_send(text)
             except Exception as e:  # noqa: BLE001
                 print(f"❌ Telegram: {e}", file=sys.stderr)
                 break
@@ -428,6 +996,18 @@ def print_all() -> None:
         print(f"всего: {len(items)}")
 
 
+def send_samples() -> None:
+    for source in SEARCH_URLS:
+        try:
+            items = collect(source)
+        except Exception as e:  # noqa: BLE001
+            print(f"❌ {SOURCE_LABELS[source]}: {e}")
+            continue
+        tg_send(format_listing(items[0], load_info(items[0])))
+        print(f"✔ {SOURCE_LABELS[source]}: отправил {items[0].id}")
+        time.sleep(1.1)
+
+
 def show_chat_ids() -> None:
     updates = tg_api("getUpdates").get("result", [])
     chats = {}
@@ -449,6 +1029,7 @@ def main() -> None:
     g.add_argument("--dry-run", action="store_true", help="показать новые объявления, ничего не отправляя")
     g.add_argument("--chat-id", action="store_true", help="узнать chat_id через getUpdates")
     g.add_argument("--test", action="store_true", help="отправить тестовое сообщение")
+    g.add_argument("--sample", action="store_true", help="прислать по одному свежему объявлению с каждого сайта")
     args = p.parse_args()
 
     if args.print:
@@ -458,6 +1039,8 @@ def main() -> None:
     elif args.test:
         tg_send("✅ Бот работает, сюда будут приходить новые квартиры.", preview=False)
         print("Отправлено.")
+    elif args.sample:
+        send_samples()
     else:
         sys.exit(run(dry_run=args.dry_run))
 
